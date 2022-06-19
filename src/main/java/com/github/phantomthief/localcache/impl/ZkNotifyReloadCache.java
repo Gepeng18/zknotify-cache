@@ -75,7 +75,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
         this.oldCleanup = wrapTry(builder.oldCleanup);
         this.maxRandomSleepOnNotifyReload = builder.maxRandomSleepOnNotifyReload;
         this.broadcaster = builder.broadcaster;
-        this.scheduleRunDuration = builder.scheduleRunDuration;
+        this.scheduleRunDuration = builder.scheduleRunDuration;  // autoReload
         this.executor = builder.executor;
         this.recycleListener = builder.recycleListener;
     }
@@ -93,6 +93,8 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
         return new Builder<>();
     }
 
+    // 直接把cachedObject拿出来，不会阻塞
+    // 第一次加载的时候会阻塞
     @Override
     public T get() {
         if (cachedObject == null) {
@@ -118,10 +120,15 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
         return notifyZkPaths;
     }
 
+    /**
+     * 1、调用cacheFactory获取值，如果失败，则调用firstAccessFailFactory获取值
+     * 2、如果获取到了值，则 zk注册，以及启动cache定时reload等逻辑
+     */
     @GuardedBy("this")
     private T init() {
         T obj;
         try {
+            // 1、调用cacheFactory获取值，如果失败，则调用firstAccessFailFactory获取值
             obj = cacheFactory.get(null);
         } catch (Throwable e) {
             if (firstAccessFailFactory != null) {
@@ -133,6 +140,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
             }
         }
 
+        // 2、如果获取到了值，则 zk注册，以及启动cache定时reload等逻辑
         if (obj != null) {
             if (postInitFuture == null) {
                 // zk subscribe等操作放到另外的线程里执行，避免被 interrupt 之后，cache 构建整个失败
@@ -169,12 +177,17 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
         return obj;
     }
 
-    // zk注册，以及启动cache定时reload等逻辑
+    /**
+     * zk注册，以及启动cache定时reload等逻辑
+     * 第一次延迟rebuild，然后定时rebuild
+     */
+
     private void postCacheInit() {
         if (broadcaster != null && notifyZkPaths != null) {
             notifyZkPaths.forEach(notifyZkPath -> {
                 AtomicLong sleeping = new AtomicLong();
                 AtomicLong lastNotifyTimestamp = new AtomicLong();
+                // 定义 zk的 onChange()
                 broadcaster.subscribe(notifyZkPath, content -> {
                     long timestamp;
                     try {
@@ -184,6 +197,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
                         timestamp = System.currentTimeMillis();
                     }
                     long lastNotify;
+                    // 只会执行一次，下一次两个值就相等了
                     do {
                         lastNotify = lastNotifyTimestamp.get();
                         if (lastNotify == timestamp) {
@@ -198,6 +212,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
                                 notifyZkPath, (deadline - currentTimeMillis()));
                         return;
                     }
+                    // 随机睡一段时间
                     long sleepFor = ofNullable(maxRandomSleepOnNotifyReload)
                             .map(LongSupplier::getAsLong)
                             .filter(it -> it > 0)
@@ -205,6 +220,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
                             .orElse(0L);
                     sleeping.set(sleepFor + currentTimeMillis());
                     // executor should not be null when enable notify
+                    // 延迟rebuild(), 即调用cacheFactory获取值
                     executor.schedule(() -> {
                         sleeping.set(0L);
                         doRebuild();
@@ -221,7 +237,9 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
             WeakReference<ZkNotifyReloadCache> cacheReference = new WeakReference<>(this);
             AtomicReference<Future<?>> futureReference = new AtomicReference<>();
             Runnable capturedRecycleListener = this.recycleListener;
+
             Future<?> scheduleFuture = scheduleWithDynamicDelay(scheduledExecutor, scheduleRunDuration, () -> {
+                // 1、从包含this的弱引用中获取值
                 ZkNotifyReloadCache thisCache = cacheReference.get();
 
                 if (thisCache == null) {
@@ -243,6 +261,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
                     }
                     return;
                 }
+                // 定时 rebuild
                 thisCache.doRebuild();
             });
             futureReference.set(scheduleFuture);
@@ -255,6 +274,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
         }
     }
 
+    // 调用cacheFactory获取值
     private void doRebuild0() {
         T newObject = null;
         try {
@@ -266,6 +286,7 @@ public class ZkNotifyReloadCache<T> implements ReloadableCache<T> {
             T old = cachedObject;
             cachedObject = newObject;
             if (oldCleanup != null && old != cachedObject) {
+                // 回调 oldCleanup，将old值传入
                 oldCleanup.accept(old);
             }
         }
